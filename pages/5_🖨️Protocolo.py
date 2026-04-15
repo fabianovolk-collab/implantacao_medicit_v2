@@ -1,0 +1,379 @@
+import os
+import streamlit as st
+import pandas as pd
+from database import carregar_clientes, carregar_implantacao, carregar_etapas, CHECKLIST_SEP
+from utils import formatar_cnpj_cpf
+from datetime import datetime
+from fpdf import FPDF
+import tempfile
+import base64
+
+st.set_page_config(layout="wide")
+st.title("📄 Protocolo de Implantação")
+
+BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
+
+# ==============================
+# CHECKLIST DINÂMICO — fonte única (etapas cadastradas)
+# ==============================
+
+@st.cache_data(ttl=300)
+def carregar_checklist_ordenado():
+    """Retorna dict {etapa: [itens]} na ordem de ordem_etapa."""
+    df = carregar_etapas()
+    if df.empty:
+        return {}, []
+    df = df.sort_values(["ordem_etapa", "ordem_item"])
+    checklist = {}
+    ordem_etapas = []
+    for _, grupo in df.groupby(["ordem_etapa", "etapa"], sort=False):
+        pass  # apenas para detectar ordem
+
+    # percorre respeitando ordem_etapa
+    etapas_ord = (
+        df[["etapa", "ordem_etapa"]]
+        .drop_duplicates()
+        .sort_values("ordem_etapa")
+    )
+    for _, row in etapas_ord.iterrows():
+        etapa = row["etapa"]
+        itens = df[df["etapa"] == etapa].sort_values("ordem_item")["item"].tolist()
+        checklist[etapa] = [i for i in itens if str(i).strip()]
+        ordem_etapas.append(etapa)
+
+    return checklist, ordem_etapas
+
+CHECKLISTS, ORDEM_ETAPAS = carregar_checklist_ordenado()
+
+# ==============================
+# FUNÇÕES AUXILIARES
+# ==============================
+
+def status_icon(status):
+    return {
+        "Concluído":         "✔",
+        "Em andamento":      "⏳",
+        "Bloqueio/Pendente": "🚨",
+        "Não iniciado":      "-"
+    }.get(status, "-")
+
+def limpar_texto(texto):
+    if not texto:
+        return ""
+    return str(texto).encode("latin-1", "ignore").decode("latin-1")
+
+def formatar_data(data):
+    if pd.isna(data) or str(data).strip() in ("", "None", "nan"):
+        return ""
+    if isinstance(data, str):
+        try:
+            data = pd.to_datetime(data, dayfirst=True)
+        except Exception:
+            return str(data)
+    return data.strftime("%d/%m/%Y")
+
+def calcular_progresso(df_cliente):
+    total = 0
+    concluidos = 0
+    for _, row in df_cliente.iterrows():
+        etapa_nome = row.get("Etapa", row.get("etapa", ""))
+        base  = CHECKLISTS.get(etapa_nome, [])
+        salvo = [i for i in str(row.get("Checklist", row.get("checklist", ""))).split(CHECKLIST_SEP) if i]
+        total      += len(base)
+        concluidos += len([i for i in base if i in salvo])
+    return int(concluidos / total * 100) if total else 0
+
+def garantir_colunas(df):
+    mapa_lower = {c.lower(): c for c in df.columns}
+    renomear = {}
+    esperados = {
+        "cliente": "Cliente", "etapa": "Etapa", "status": "Status",
+        "motivo": "Motivo", "responsavel_medicit": "Responsavel_Etapa",
+        "responsavel_cliente": "Responsavel_Cliente",
+        "participantes": "Participantes",
+        "data_inicio": "Data_Inicio", "data_conclusao": "Data_Conclusao",
+        "checklist": "Checklist", "cnpj_cpf": "cnpj_cpf"
+    }
+    for lower, padrao in esperados.items():
+        if lower in mapa_lower:
+            renomear[mapa_lower[lower]] = padrao
+    df = df.rename(columns=renomear)
+    for col in esperados.values():
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+def ordenar_por_etapa(df_cliente):
+    """Ordena as linhas do cliente seguindo a ordem de ordem_etapa do cadastro."""
+    if not ORDEM_ETAPAS:
+        return df_cliente
+    ordem_map = {etapa: i for i, etapa in enumerate(ORDEM_ETAPAS)}
+    df_copia  = df_cliente.copy()
+    df_copia["_ordem"] = df_copia["Etapa"].map(lambda e: ordem_map.get(str(e).strip(), 999))
+    return df_copia.sort_values("_ordem").drop(columns=["_ordem"])
+
+# ==============================
+# CARREGAR DADOS
+# ==============================
+
+clientes_df = carregar_clientes().fillna("")
+df_impl     = carregar_implantacao().fillna("")
+df_impl     = garantir_colunas(df_impl)
+
+clientes_df = clientes_df.sort_values("Nome") if "Nome" in clientes_df.columns else clientes_df
+
+# ==============================
+# SELEÇÃO DE CLIENTE
+# ==============================
+
+st.subheader("📌 Selecionar Cliente")
+col1, col2 = st.columns(2)
+
+with col1:
+    doc_busca = st.text_input("🔎 Buscar por CPF/CNPJ ou Nome")
+
+if doc_busca:
+    clientes_filtrados = clientes_df[
+        clientes_df["cnpj_cpf"].astype(str).str.contains(doc_busca, na=False) |
+        clientes_df["Nome"].str.lower().str.contains(doc_busca.lower(), na=False)
+    ]
+else:
+    clientes_filtrados = clientes_df.copy()
+
+if clientes_filtrados.empty:
+    st.warning("Nenhum cliente encontrado.")
+    st.stop()
+
+lista_clientes = ["-- Selecione --"] + clientes_filtrados["Nome"].tolist()
+with col2:
+    cliente_sel = st.selectbox("Selecione o cliente", lista_clientes)
+
+if cliente_sel == "-- Selecione --":
+    st.warning("Selecione um cliente para continuar.")
+    st.stop()
+
+linha_cliente = clientes_filtrados[clientes_filtrados["Nome"] == cliente_sel]
+if linha_cliente.empty:
+    st.error("Cliente não encontrado na base.")
+    st.stop()
+
+doc_sel = linha_cliente.iloc[0]["cnpj_cpf"]
+
+# Filtra por cnpj_cpf (mais confiável que nome)
+df_cliente = df_impl[df_impl["cnpj_cpf"] == doc_sel].copy()
+
+if df_cliente.empty:
+    st.info("Nenhuma implantação encontrada para este cliente.")
+    st.stop()
+
+# ── Ordena seguindo ordem_etapa do cadastro ──
+df_cliente = ordenar_por_etapa(df_cliente)
+
+# ==============================
+# PROGRESSO GERAL
+# ==============================
+
+progresso = calcular_progresso(df_cliente)
+st.progress(progresso / 100)
+st.write(f"**Progresso Geral: {progresso}%**")
+
+# ==============================
+# VISUALIZAÇÃO POR ETAPA (na ordem correta)
+# ==============================
+
+col1, col2 = st.columns(2)
+for i, (_, row) in enumerate(df_cliente.iterrows()):
+    container = col1 if i % 2 == 0 else col2
+    etapa_nome = row.get("Etapa", "")
+    status_val = row.get("Status", "")
+
+    with container:
+        st.markdown(f"""
+        ### {status_icon(status_val)} {etapa_nome}
+        **Status:** {status_val}
+        **Responsável Medicit:** {row.get('Responsavel_Etapa', '')}
+        **Responsável Cliente:** {row.get('Responsavel_Cliente', '')}
+        **Participantes:** {row.get('Participantes', '')}
+        **Início:** {formatar_data(row.get('Data_Inicio', ''))}
+        **Conclusão:** {formatar_data(row.get('Data_Conclusao', ''))}
+        """)
+
+        if status_val == "Bloqueio/Pendente":
+            motivo_txt = row.get("Motivo", "")
+            st.markdown(
+                "<div style='"
+                "background-color:#fff0f0;"
+                "border:2px solid #cc0000;"
+                "border-radius:6px;"
+                "padding:10px 14px;"
+                "margin:6px 0;"
+                "white-space:pre-wrap;"
+                "word-break:break-word;"
+                "'>"
+                "<span style='color:#cc0000;font-weight:700;font-size:15px'>"
+                "🚨 BLOQUEIO / PENDENTE</span><br><br>"
+                f"<span style='color:#990000;font-size:14px'>{motivo_txt}</span>"
+                "</div>",
+                unsafe_allow_html=True
+            )
+
+        base  = CHECKLISTS.get(etapa_nome, [])
+        salvo = [i for i in str(row.get("Checklist", "")).split(CHECKLIST_SEP) if i]
+
+        if base:
+            st.markdown("**Checklist:**")
+            for item in base:
+                # wrap longo em markdown para não cortar
+                st.markdown(f"{'✔' if item in salvo else '⬜'} {item}")
+
+# ==============================
+# PDF
+# ==============================
+
+class PDF(FPDF):
+    def __init__(self, logo_path=""):
+        super().__init__()
+        self.logo_path = logo_path
+
+    def header(self):
+        if self.logo_path and os.path.exists(self.logo_path):
+            self.image(self.logo_path, 10, 8, 50)
+        self.set_font("Arial", "B", 16)
+        self.cell(0, 10, "Protocolo de Implantacao", 0, 1, "C")
+        self.ln(10)
+        self.set_draw_color(200, 200, 200)
+        self.line(10, self.get_y(), 200, self.get_y())
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Arial", "I", 8)
+        self.cell(0, 10, f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}", 0, 0, "C")
+
+    def barra_progresso(self, percentual):
+        self.set_fill_color(230, 230, 230)
+        self.rect(10, self.get_y(), 190, 6, "F")
+        if percentual > 0:
+            largura = min((percentual / 100) * 190, 190)
+            if percentual == 100:
+                self.set_fill_color(0, 176, 80)
+            elif percentual >= 50:
+                self.set_fill_color(0, 102, 204)
+            else:
+                self.set_fill_color(255, 192, 0)
+            self.rect(10, self.get_y(), largura, 6, "F")
+        self.ln(8)
+
+def progresso_etapa(row):
+    etapa_nome = row.get("Etapa", "")
+    base  = CHECKLISTS.get(etapa_nome, [])
+    salvo = [i for i in str(row.get("Checklist", "")).split(CHECKLIST_SEP) if i]
+    return int(len([i for i in base if i in salvo]) / len(base) * 100) if base else 0
+
+def gerar_pdf(df_cliente, cliente, progresso, doc_sel):
+    pdf = PDF(logo_path=LOGO_PATH)
+    pdf.add_page()
+    pdf.set_font("Arial", "", 11)
+
+    data_inicio_impl = (
+        df_cliente["Data_Inicio"].replace("", None).dropna().min()
+        if "Data_Inicio" in df_cliente.columns else ""
+    )
+
+    pdf.cell(0, 6, f"Cliente: {limpar_texto(cliente)}", 0, 1)
+    pdf.cell(0, 6, f"CPF/CNPJ: {formatar_cnpj_cpf(doc_sel)}", 0, 1)
+    pdf.cell(0, 6, f"Inicio da Implantacao: {formatar_data(data_inicio_impl)}", 0, 1)
+    pdf.ln(3)
+    pdf.cell(0, 5, f"Progresso Geral: {progresso}%", 0, 1)
+    pdf.barra_progresso(progresso)
+    pdf.ln(3)
+
+    # df_cliente já vem ordenado por ordem_etapa
+    for _, row in df_cliente.iterrows():
+        prog       = progresso_etapa(row)
+        etapa_nome = row.get("Etapa", "")
+
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 6, f"Etapa: {limpar_texto(etapa_nome)}", 0, 1)
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 5, f"Status: {limpar_texto(row.get('Status',''))}", 0, 1)
+        pdf.cell(0, 5, f"Responsavel Medicit: {limpar_texto(row.get('Responsavel_Etapa',''))}", 0, 1)
+        pdf.cell(0, 5, f"Responsavel Cliente: {limpar_texto(row.get('Responsavel_Cliente',''))}", 0, 1)
+        pdf.cell(0, 5, f"Participantes: {limpar_texto(row.get('Participantes',''))}", 0, 1)
+        pdf.cell(0, 5, f"Data Inicio: {formatar_data(row.get('Data_Inicio',''))}", 0, 1)
+        pdf.cell(0, 5, f"Data Conclusao: {formatar_data(row.get('Data_Conclusao',''))}", 0, 1)
+
+        if row.get("Status") == "Bloqueio/Pendente":
+            motivo_str = limpar_texto(row.get("Motivo", ""))
+            # Guarda Y inicial do box
+            y_inicio_box = pdf.get_y()
+            # Escreve o texto em vermelho negrito dentro de uma área temporária
+            # para medir a altura real antes de desenhar o rect
+            pdf.set_text_color(180, 0, 0)
+            pdf.set_font("Arial", "B", 10)
+            # Usa set_xy para posicionar com margem interna
+            pdf.set_xy(12, y_inicio_box + 4)
+            pdf.multi_cell(186, 5, f"BLOQUEIO/PENDENTE - Motivo: {motivo_str}", border=0)
+            # Y após o texto — guarda posição final
+            y_fim_texto = pdf.get_y() + 4
+            altura_real = y_fim_texto - y_inicio_box
+            # Desenha o rect sobre a área já escrita (sem clip — FPDF sobrepõe)
+            pdf.set_fill_color(255, 230, 230)
+            pdf.set_draw_color(200, 0, 0)
+            pdf.rect(10, y_inicio_box, 190, altura_real, "D")  # só borda, sem fill por cima
+            # Move cursor para abaixo do box com espaço
+            pdf.set_y(y_fim_texto + 2)
+            # Restaura estilo padrão
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_draw_color(0, 0, 0)
+            pdf.set_fill_color(255, 255, 255)
+            pdf.set_font("Arial", "", 10)
+            pdf.ln(1)
+
+        base  = CHECKLISTS.get(etapa_nome, [])
+        salvo = [i for i in str(row.get("Checklist", "")).split(CHECKLIST_SEP) if i]
+
+        if base:
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 5, "Checklist:", 0, 1)
+            pdf.set_font("Arial", "", 10)
+            for item in base:
+                # multi_cell garante quebra de linha para itens longos
+                marcacao = "X" if item in salvo else " "
+                pdf.multi_cell(190, 5, f"[{marcacao}] {limpar_texto(item)}", border=0)
+
+        status_texto = (
+            "Nao iniciado" if prog == 0 else
+            "Em risco"     if prog <= 50 else
+            "Em andamento" if prog < 100 else
+            "Concluido"
+        )
+        pdf.ln(2)
+        pdf.cell(0, 5, f"Progresso Etapa: {prog}% - {status_texto}", 0, 1)
+        pdf.barra_progresso(prog)
+        pdf.set_draw_color(220, 220, 220)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(5)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmp.name)
+    return tmp.name
+
+# ==============================
+# BOTÃO GERAR PDF
+# ==============================
+
+st.markdown("---")
+if st.button("📄 Gerar Protocolo Executivo"):
+    pdf_path = gerar_pdf(df_cliente, cliente_sel, progresso, doc_sel)
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    b64  = base64.b64encode(pdf_bytes).decode()
+    href = (
+        f'<a id="dl" href="data:application/pdf;base64,{b64}" '
+        f'download="protocolo_{cliente_sel}.pdf"></a>'
+        f'<script>document.getElementById("dl").click();</script>'
+    )
+    st.components.v1.html(href, height=0)
+    st.success("✅ Protocolo gerado com sucesso!")
